@@ -22,6 +22,15 @@ MODULE_ALIAS("ipt_MARK");
 MODULE_ALIAS("ip6t_MARK");
 MODULE_ALIAS("arpt_MARK");
 
+struct xt_mark_tginfo2 {
+	__u32 mark, mask;
+};
+
+struct xt_mark_mtinfo1 {
+	__u32 mark, mask;
+	__u8 invert;
+};
+
 static unsigned int
 mark_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
