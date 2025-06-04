@@ -5,22 +5,24 @@
 
 #include "kublk.h"
 
+#define MAX_NR_TGT_ARG 	64
+
 unsigned int ublk_dbg_mask = UBLK_LOG;
 static const struct ublk_tgt_ops *tgt_ops_list[] = {
 	&null_tgt_ops,
 	&loop_tgt_ops,
 	&stripe_tgt_ops,
+	&fault_inject_tgt_ops,
 };
 
 static const struct ublk_tgt_ops *ublk_find_tgt(const char *name)
 {
-	const struct ublk_tgt_ops *ops;
 	int i;
 
 	if (name == NULL)
 		return NULL;
 
-	for (i = 0; sizeof(tgt_ops_list) / sizeof(ops); i++)
+	for (i = 0; i < ARRAY_SIZE(tgt_ops_list); i++)
 		if (strcmp(tgt_ops_list[i]->name, name) == 0)
 			return tgt_ops_list[i];
 	return NULL;
@@ -118,6 +120,27 @@ static int ublk_ctrl_start_dev(struct ublk_dev *dev,
 	return __ublk_ctrl_cmd(dev, &data);
 }
 
+static int ublk_ctrl_start_user_recovery(struct ublk_dev *dev)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_U_CMD_START_USER_RECOVERY,
+	};
+
+	return __ublk_ctrl_cmd(dev, &data);
+}
+
+static int ublk_ctrl_end_user_recovery(struct ublk_dev *dev, int daemon_pid)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_U_CMD_END_USER_RECOVERY,
+		.flags	= CTRL_CMD_HAS_DATA,
+	};
+
+	dev->dev_info.ublksrv_pid = data.data[0] = daemon_pid;
+
+	return __ublk_ctrl_cmd(dev, &data);
+}
+
 static int ublk_ctrl_add_dev(struct ublk_dev *dev)
 {
 	struct ublk_ctrl_cmd_data data = {
@@ -193,6 +216,30 @@ static int ublk_ctrl_get_features(struct ublk_dev *dev,
 	return __ublk_ctrl_cmd(dev, &data);
 }
 
+static int ublk_ctrl_update_size(struct ublk_dev *dev,
+		__u64 nr_sects)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_U_CMD_UPDATE_SIZE,
+		.flags	= CTRL_CMD_HAS_DATA,
+	};
+
+	data.data[0] = nr_sects;
+	return __ublk_ctrl_cmd(dev, &data);
+}
+
+static int ublk_ctrl_quiesce_dev(struct ublk_dev *dev,
+				 unsigned int timeout_ms)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_U_CMD_QUIESCE_DEV,
+		.flags	= CTRL_CMD_HAS_DATA,
+	};
+
+	data.data[0] = timeout_ms;
+	return __ublk_ctrl_cmd(dev, &data);
+}
+
 static const char *ublk_dev_state_desc(struct ublk_dev *dev)
 {
 	switch (dev->dev_info.state) {
@@ -207,15 +254,84 @@ static const char *ublk_dev_state_desc(struct ublk_dev *dev)
 	};
 }
 
+static void ublk_print_cpu_set(const cpu_set_t *set, char *buf, unsigned len)
+{
+	unsigned done = 0;
+	int i;
+
+	for (i = 0; i < CPU_SETSIZE; i++) {
+		if (CPU_ISSET(i, set))
+			done += snprintf(&buf[done], len - done, "%d ", i);
+	}
+}
+
+static void ublk_adjust_affinity(cpu_set_t *set)
+{
+	int j, updated = 0;
+
+	/*
+	 * Just keep the 1st CPU now.
+	 *
+	 * In future, auto affinity selection can be tried.
+	 */
+	for (j = 0; j < CPU_SETSIZE; j++) {
+		if (CPU_ISSET(j, set)) {
+			if (!updated) {
+				updated = 1;
+				continue;
+			}
+			CPU_CLR(j, set);
+		}
+	}
+}
+
+/* Caller must free the allocated buffer */
+static int ublk_ctrl_get_affinity(struct ublk_dev *ctrl_dev, cpu_set_t **ptr_buf)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_U_CMD_GET_QUEUE_AFFINITY,
+		.flags	= CTRL_CMD_HAS_DATA | CTRL_CMD_HAS_BUF,
+	};
+	cpu_set_t *buf;
+	int i, ret;
+
+	buf = malloc(sizeof(cpu_set_t) * ctrl_dev->dev_info.nr_hw_queues);
+	if (!buf)
+		return -ENOMEM;
+
+	for (i = 0; i < ctrl_dev->dev_info.nr_hw_queues; i++) {
+		data.data[0] = i;
+		data.len = sizeof(cpu_set_t);
+		data.addr = (__u64)&buf[i];
+
+		ret = __ublk_ctrl_cmd(ctrl_dev, &data);
+		if (ret < 0) {
+			free(buf);
+			return ret;
+		}
+		ublk_adjust_affinity(&buf[i]);
+	}
+
+	*ptr_buf = buf;
+	return 0;
+}
+
 static void ublk_ctrl_dump(struct ublk_dev *dev)
 {
 	struct ublksrv_ctrl_dev_info *info = &dev->dev_info;
 	struct ublk_params p;
+	cpu_set_t *affinity;
 	int ret;
 
 	ret = ublk_ctrl_get_params(dev, &p);
 	if (ret < 0) {
 		ublk_err("failed to get params %d %s\n", ret, strerror(-ret));
+		return;
+	}
+
+	ret = ublk_ctrl_get_affinity(dev, &affinity);
+	if (ret < 0) {
+		ublk_err("failed to get affinity %m\n");
 		return;
 	}
 
@@ -225,6 +341,19 @@ static void ublk_ctrl_dump(struct ublk_dev *dev)
 	ublk_log("\tmax rq size %d daemon pid %d flags 0x%llx state %s\n",
 			info->max_io_buf_bytes, info->ublksrv_pid, info->flags,
 			ublk_dev_state_desc(dev));
+
+	if (affinity) {
+		char buf[512];
+		int i;
+
+		for (i = 0; i < info->nr_hw_queues; i++) {
+			ublk_print_cpu_set(&affinity[i], buf, sizeof(buf));
+			printf("\tqueue %u: tid %d affinity(%s)\n",
+					i, dev->q[i].tid, buf);
+		}
+		free(affinity);
+	}
+
 	fflush(stdout);
 }
 
@@ -300,7 +429,7 @@ static void ublk_queue_deinit(struct ublk_queue *q)
 		free(q->ios[i].buf_addr);
 }
 
-static int ublk_queue_init(struct ublk_queue *q)
+static int ublk_queue_init(struct ublk_queue *q, unsigned extra_flags)
 {
 	struct ublk_dev *dev = q->dev;
 	int depth = dev->dev_info.queue_depth;
@@ -315,10 +444,14 @@ static int ublk_queue_init(struct ublk_queue *q)
 	q->cmd_inflight = 0;
 	q->tid = gettid();
 
-	if (dev->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY) {
+	if (dev->dev_info.flags & (UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_AUTO_BUF_REG)) {
 		q->state |= UBLKSRV_NO_BUF;
-		q->state |= UBLKSRV_ZC;
+		if (dev->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY)
+			q->state |= UBLKSRV_ZC;
+		if (dev->dev_info.flags & UBLK_F_AUTO_BUF_REG)
+			q->state |= UBLKSRV_AUTO_BUF_REG;
 	}
+	q->state |= extra_flags;
 
 	cmd_buf_size = ublk_queue_cmd_buf_sz(q);
 	off = UBLKSRV_CMD_BUF_OFFSET + q->q_id * ublk_queue_max_cmd_buf_sz();
@@ -347,14 +480,16 @@ static int ublk_queue_init(struct ublk_queue *q)
 	}
 
 	ret = ublk_setup_ring(&q->ring, ring_depth, cq_depth,
-			IORING_SETUP_COOP_TASKRUN);
+			IORING_SETUP_COOP_TASKRUN |
+			IORING_SETUP_SINGLE_ISSUER |
+			IORING_SETUP_DEFER_TASKRUN);
 	if (ret < 0) {
 		ublk_err("ublk dev %d queue %d setup io_uring failed %d\n",
 				q->dev->dev_info.dev_id, q->q_id, ret);
 		goto fail;
 	}
 
-	if (dev->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY) {
+	if (dev->dev_info.flags & (UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_AUTO_BUF_REG)) {
 		ret = io_uring_register_buffers_sparse(&q->ring, q->q_depth);
 		if (ret) {
 			ublk_err("ublk dev %d queue %d register spare buffers failed %d",
@@ -418,6 +553,23 @@ static void ublk_dev_unprep(struct ublk_dev *dev)
 	close(dev->fds[0]);
 }
 
+static void ublk_set_auto_buf_reg(const struct ublk_queue *q,
+				  struct io_uring_sqe *sqe,
+				  unsigned short tag)
+{
+	struct ublk_auto_buf_reg buf = {};
+
+	if (q->tgt_ops->buf_index)
+		buf.index = q->tgt_ops->buf_index(q, tag);
+	else
+		buf.index = tag;
+
+	if (q->state & UBLKSRV_AUTO_BUF_REG_FALLBACK)
+		buf.flags = UBLK_AUTO_BUF_REG_FALLBACK;
+
+	sqe->addr = ublk_auto_buf_reg_to_sqe_addr(&buf);
+}
+
 int ublk_queue_io_cmd(struct ublk_queue *q, struct ublk_io *io, unsigned tag)
 {
 	struct ublksrv_io_cmd *cmd;
@@ -429,12 +581,17 @@ int ublk_queue_io_cmd(struct ublk_queue *q, struct ublk_io *io, unsigned tag)
 	if (!(io->flags & UBLKSRV_IO_FREE))
 		return 0;
 
-	/* we issue because we need either fetching or committing */
+	/*
+	 * we issue because we need either fetching or committing or
+	 * getting data
+	 */
 	if (!(io->flags &
-		(UBLKSRV_NEED_FETCH_RQ | UBLKSRV_NEED_COMMIT_RQ_COMP)))
+		(UBLKSRV_NEED_FETCH_RQ | UBLKSRV_NEED_COMMIT_RQ_COMP | UBLKSRV_NEED_GET_DATA)))
 		return 0;
 
-	if (io->flags & UBLKSRV_NEED_COMMIT_RQ_COMP)
+	if (io->flags & UBLKSRV_NEED_GET_DATA)
+		cmd_op = UBLK_U_IO_NEED_GET_DATA;
+	else if (io->flags & UBLKSRV_NEED_COMMIT_RQ_COMP)
 		cmd_op = UBLK_U_IO_COMMIT_AND_FETCH_REQ;
 	else if (io->flags & UBLKSRV_NEED_FETCH_RQ)
 		cmd_op = UBLK_U_IO_FETCH_REQ;
@@ -466,6 +623,9 @@ int ublk_queue_io_cmd(struct ublk_queue *q, struct ublk_io *io, unsigned tag)
 		cmd->addr	= (__u64) (uintptr_t) io->buf_addr;
 	else
 		cmd->addr	= 0;
+
+	if (q->state & UBLKSRV_AUTO_BUF_REG)
+		ublk_set_auto_buf_reg(q, sqe[0], tag);
 
 	user_data = build_user_data(tag, _IOC_NR(cmd_op), 0, 0);
 	io_uring_sqe_set_data64(sqe[0], user_data);
@@ -551,6 +711,9 @@ static void ublk_handle_cqe(struct io_uring *r,
 		assert(tag < q->q_depth);
 		if (q->tgt_ops->queue_io)
 			q->tgt_ops->queue_io(q, tag);
+	} else if (cqe->res == UBLK_IO_RES_NEED_GET_DATA) {
+		io->flags |= UBLKSRV_NEED_GET_DATA | UBLKSRV_IO_FREE;
+		ublk_queue_io_cmd(q, io, tag);
 	} else {
 		/*
 		 * COMMIT_REQ will be completed immediately since no fetching
@@ -602,18 +765,42 @@ static int ublk_process_io(struct ublk_queue *q)
 	return reapped;
 }
 
+static void ublk_queue_set_sched_affinity(const struct ublk_queue *q,
+		cpu_set_t *cpuset)
+{
+        if (sched_setaffinity(0, sizeof(*cpuset), cpuset) < 0)
+                ublk_err("ublk dev %u queue %u set affinity failed",
+                                q->dev->dev_info.dev_id, q->q_id);
+}
+
+struct ublk_queue_info {
+	struct ublk_queue 	*q;
+	sem_t 			*queue_sem;
+	cpu_set_t 		*affinity;
+	unsigned char 		auto_zc_fallback;
+};
+
 static void *ublk_io_handler_fn(void *data)
 {
-	struct ublk_queue *q = data;
+	struct ublk_queue_info *info = data;
+	struct ublk_queue *q = info->q;
 	int dev_id = q->dev->dev_info.dev_id;
+	unsigned extra_flags = 0;
 	int ret;
 
-	ret = ublk_queue_init(q);
+	if (info->auto_zc_fallback)
+		extra_flags = UBLKSRV_AUTO_BUF_REG_FALLBACK;
+
+	ret = ublk_queue_init(q, extra_flags);
 	if (ret) {
 		ublk_err("ublk dev %d queue %d init queue failed\n",
 				dev_id, q->q_id);
 		return NULL;
 	}
+	/* IO perf is sensitive with queue pthread affinity on NUMA machine*/
+	ublk_queue_set_sched_affinity(q, info->affinity);
+	sem_post(info->queue_sem);
+
 	ublk_dbg(UBLK_DBG_QUEUE, "tid %d: ublk dev %d queue %d started\n",
 			q->tid, dev_id, q->q_id);
 
@@ -639,7 +826,7 @@ static void ublk_set_parameters(struct ublk_dev *dev)
 				dev->dev_info.dev_id, ret);
 }
 
-static int ublk_send_dev_event(const struct dev_ctx *ctx, int dev_id)
+static int ublk_send_dev_event(const struct dev_ctx *ctx, struct ublk_dev *dev, int dev_id)
 {
 	uint64_t id;
 	int evtfd = ctx->_evtfd;
@@ -652,8 +839,14 @@ static int ublk_send_dev_event(const struct dev_ctx *ctx, int dev_id)
 	else
 		id = ERROR_EVTFD_DEVID;
 
+	if (dev && ctx->shadow_dev)
+		memcpy(&ctx->shadow_dev->q, &dev->q, sizeof(dev->q));
+
 	if (write(evtfd, &id, sizeof(id)) != sizeof(id))
 		return -EINVAL;
+
+	close(evtfd);
+	shmdt(ctx->shadow_dev);
 
 	return 0;
 }
@@ -661,27 +854,54 @@ static int ublk_send_dev_event(const struct dev_ctx *ctx, int dev_id)
 
 static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 {
-	int ret, i;
-	void *thread_ret;
 	const struct ublksrv_ctrl_dev_info *dinfo = &dev->dev_info;
+	struct ublk_queue_info *qinfo;
+	cpu_set_t *affinity_buf;
+	void *thread_ret;
+	sem_t queue_sem;
+	int ret, i;
 
 	ublk_dbg(UBLK_DBG_DEV, "%s enter\n", __func__);
 
+	qinfo = (struct ublk_queue_info *)calloc(sizeof(struct ublk_queue_info),
+			dinfo->nr_hw_queues);
+	if (!qinfo)
+		return -ENOMEM;
+
+	sem_init(&queue_sem, 0, 0);
 	ret = ublk_dev_prep(ctx, dev);
+	if (ret)
+		return ret;
+
+	ret = ublk_ctrl_get_affinity(dev, &affinity_buf);
 	if (ret)
 		return ret;
 
 	for (i = 0; i < dinfo->nr_hw_queues; i++) {
 		dev->q[i].dev = dev;
 		dev->q[i].q_id = i;
+
+		qinfo[i].q = &dev->q[i];
+		qinfo[i].queue_sem = &queue_sem;
+		qinfo[i].affinity = &affinity_buf[i];
+		qinfo[i].auto_zc_fallback = ctx->auto_zc_fallback;
 		pthread_create(&dev->q[i].thread, NULL,
 				ublk_io_handler_fn,
-				&dev->q[i]);
+				&qinfo[i]);
 	}
 
+	for (i = 0; i < dinfo->nr_hw_queues; i++)
+		sem_wait(&queue_sem);
+	free(qinfo);
+	free(affinity_buf);
+
 	/* everything is fine now, start us */
-	ublk_set_parameters(dev);
-	ret = ublk_ctrl_start_dev(dev, getpid());
+	if (ctx->recovery)
+		ret = ublk_ctrl_end_user_recovery(dev, getpid());
+	else {
+		ublk_set_parameters(dev);
+		ret = ublk_ctrl_start_dev(dev, getpid());
+	}
 	if (ret < 0) {
 		ublk_err("%s: ublk_ctrl_start_dev failed: %d\n", __func__, ret);
 		goto fail;
@@ -691,7 +911,7 @@ static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 	if (ctx->fg)
 		ublk_ctrl_dump(dev);
 	else
-		ublk_send_dev_event(ctx, dev->dev_info.dev_id);
+		ublk_send_dev_event(ctx, dev, dev->dev_info.dev_id);
 
 	/* wait until we are terminated */
 	for (i = 0; i < dinfo->nr_hw_queues; i++)
@@ -845,6 +1065,9 @@ static int __cmd_dev_add(const struct dev_ctx *ctx)
 	info->nr_hw_queues = nr_queues;
 	info->queue_depth = depth;
 	info->flags = ctx->flags;
+	if ((features & UBLK_F_QUIESCE) &&
+			(info->flags & UBLK_F_USER_RECOVERY))
+		info->flags |= UBLK_F_QUIESCE;
 	dev->tgt.ops = ops;
 	dev->tgt.sq_depth = depth;
 	dev->tgt.cq_depth = depth;
@@ -856,7 +1079,10 @@ static int __cmd_dev_add(const struct dev_ctx *ctx)
 		}
 	}
 
-	ret = ublk_ctrl_add_dev(dev);
+	if (ctx->recovery)
+		ret = ublk_ctrl_start_user_recovery(dev);
+	else
+		ret = ublk_ctrl_add_dev(dev);
 	if (ret < 0) {
 		ublk_err("%s: can't add dev id %d, type %s ret %d\n",
 				__func__, dev_id, tgt_type, ret);
@@ -870,7 +1096,7 @@ static int __cmd_dev_add(const struct dev_ctx *ctx)
 
 fail:
 	if (ret < 0)
-		ublk_send_dev_event(ctx, -1);
+		ublk_send_dev_event(ctx, dev, -1);
 	ublk_ctrl_deinit(dev);
 	return ret;
 }
@@ -884,30 +1110,58 @@ static int cmd_dev_add(struct dev_ctx *ctx)
 	if (ctx->fg)
 		goto run;
 
+	ctx->_shmid = shmget(IPC_PRIVATE, sizeof(struct ublk_dev), IPC_CREAT | 0666);
+	if (ctx->_shmid < 0) {
+		ublk_err("%s: failed to shmget %s\n", __func__, strerror(errno));
+		exit(-1);
+	}
+	ctx->shadow_dev = (struct ublk_dev *)shmat(ctx->_shmid, NULL, 0);
+	if (ctx->shadow_dev == (struct ublk_dev *)-1) {
+		ublk_err("%s: failed to shmat %s\n", __func__, strerror(errno));
+		exit(-1);
+	}
 	ctx->_evtfd = eventfd(0, 0);
 	if (ctx->_evtfd < 0) {
 		ublk_err("%s: failed to create eventfd %s\n", __func__, strerror(errno));
 		exit(-1);
 	}
 
-	setsid();
 	res = fork();
 	if (res == 0) {
+		int res2;
+
+		setsid();
+		res2 = fork();
+		if (res2 == 0) {
+			/* prepare for detaching */
+			close(STDIN_FILENO);
+			close(STDOUT_FILENO);
+			close(STDERR_FILENO);
 run:
-		res = __cmd_dev_add(ctx);
-		return res;
+			res = __cmd_dev_add(ctx);
+			return res;
+		} else {
+			/* detached from the foreground task */
+			exit(EXIT_SUCCESS);
+		}
 	} else if (res > 0) {
 		uint64_t id;
+		int exit_code = EXIT_FAILURE;
 
 		res = read(ctx->_evtfd, &id, sizeof(id));
 		close(ctx->_evtfd);
 		if (res == sizeof(id) && id != ERROR_EVTFD_DEVID) {
 			ctx->dev_id = id - 1;
-			return __cmd_dev_list(ctx);
+			if (__cmd_dev_list(ctx) >= 0)
+				exit_code = EXIT_SUCCESS;
 		}
-		exit(EXIT_FAILURE);
+		shmdt(ctx->shadow_dev);
+		shmctl(ctx->_shmid, IPC_RMID, NULL);
+		/* wait for child and detach from it */
+		wait(NULL);
+		exit(exit_code);
 	} else {
-		return res;
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -969,6 +1223,9 @@ static int __cmd_dev_list(struct dev_ctx *ctx)
 			ublk_err("%s: can't get dev info from %d: %d\n",
 					__func__, ctx->dev_id, ret);
 	} else {
+		if (ctx->shadow_dev)
+			memcpy(&dev->q, ctx->shadow_dev->q, sizeof(dev->q));
+
 		ublk_ctrl_dump(dev);
 	}
 
@@ -1006,6 +1263,9 @@ static int cmd_dev_get_features(void)
 		[const_ilog2(UBLK_F_USER_COPY)] = "USER_COPY",
 		[const_ilog2(UBLK_F_ZONED)] = "ZONED",
 		[const_ilog2(UBLK_F_USER_RECOVERY_FAIL_IO)] = "RECOVERY_FAIL_IO",
+		[const_ilog2(UBLK_F_UPDATE_SIZE)] = "UPDATE_SIZE",
+		[const_ilog2(UBLK_F_AUTO_BUF_REG)] = "AUTO_BUF_REG",
+		[const_ilog2(UBLK_F_QUIESCE)] = "QUIESCE",
 	};
 	struct ublk_dev *dev;
 	__u64 features = 0;
@@ -1039,15 +1299,103 @@ static int cmd_dev_get_features(void)
 	return ret;
 }
 
+static int cmd_dev_update_size(struct dev_ctx *ctx)
+{
+	struct ublk_dev *dev = ublk_ctrl_init();
+	struct ublk_params p;
+	int ret = -EINVAL;
+
+	if (!dev)
+		return -ENODEV;
+
+	if (ctx->dev_id < 0) {
+		fprintf(stderr, "device id isn't provided\n");
+		goto out;
+	}
+
+	dev->dev_info.dev_id = ctx->dev_id;
+	ret = ublk_ctrl_get_params(dev, &p);
+	if (ret < 0) {
+		ublk_err("failed to get params %d %s\n", ret, strerror(-ret));
+		goto out;
+	}
+
+	if (ctx->size & ((1 << p.basic.logical_bs_shift) - 1)) {
+		ublk_err("size isn't aligned with logical block size\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = ublk_ctrl_update_size(dev, ctx->size >> 9);
+out:
+	ublk_ctrl_deinit(dev);
+	return ret;
+}
+
+static int cmd_dev_quiesce(struct dev_ctx *ctx)
+{
+	struct ublk_dev *dev = ublk_ctrl_init();
+	int ret = -EINVAL;
+
+	if (!dev)
+		return -ENODEV;
+
+	if (ctx->dev_id < 0) {
+		fprintf(stderr, "device id isn't provided for quiesce\n");
+		goto out;
+	}
+	dev->dev_info.dev_id = ctx->dev_id;
+	ret = ublk_ctrl_quiesce_dev(dev, 10000);
+
+out:
+	ublk_ctrl_deinit(dev);
+	return ret;
+}
+
+static void __cmd_create_help(char *exe, bool recovery)
+{
+	int i;
+
+	printf("%s %s -t [null|loop|stripe|fault_inject] [-q nr_queues] [-d depth] [-n dev_id]\n",
+			exe, recovery ? "recover" : "add");
+	printf("\t[--foreground] [--quiet] [-z] [--auto_zc] [--auto_zc_fallback] [--debug_mask mask] [-r 0|1 ] [-g]\n");
+	printf("\t[-e 0|1 ] [-i 0|1]\n");
+	printf("\t[target options] [backfile1] [backfile2] ...\n");
+	printf("\tdefault: nr_queues=2(max 32), depth=128(max 1024), dev_id=-1(auto allocation)\n");
+
+	for (i = 0; i < sizeof(tgt_ops_list) / sizeof(tgt_ops_list[0]); i++) {
+		const struct ublk_tgt_ops *ops = tgt_ops_list[i];
+
+		if (ops->usage)
+			ops->usage(ops);
+	}
+}
+
+static void cmd_add_help(char *exe)
+{
+	__cmd_create_help(exe, false);
+	printf("\n");
+}
+
+static void cmd_recover_help(char *exe)
+{
+	__cmd_create_help(exe, true);
+	printf("\tPlease provide exact command line for creating this device with real dev_id\n");
+	printf("\n");
+}
+
 static int cmd_dev_help(char *exe)
 {
-	printf("%s add -t [null|loop] [-q nr_queues] [-d depth] [-n dev_id] [backfile1] [backfile2] ...\n", exe);
-	printf("\t default: nr_queues=2(max 4), depth=128(max 128), dev_id=-1(auto allocation)\n");
+	cmd_add_help(exe);
+	cmd_recover_help(exe);
+
 	printf("%s del [-n dev_id] -a \n", exe);
-	printf("\t -a delete all devices -n delete specified device\n");
+	printf("\t -a delete all devices -n delete specified device\n\n");
 	printf("%s list [-n dev_id] -a \n", exe);
-	printf("\t -a list all devices, -n list specified device, default -a \n");
+	printf("\t -a list all devices, -n list specified device, default -a \n\n");
 	printf("%s features\n", exe);
+	printf("%s update_size -n dev_id -s|--size size_in_bytes \n", exe);
+	printf("%s quiesce -n dev_id\n", exe);
 	return 0;
 }
 
@@ -1063,9 +1411,16 @@ int main(int argc, char *argv[])
 		{ "quiet",		0,	NULL,  0  },
 		{ "zero_copy",          0,      NULL, 'z' },
 		{ "foreground",		0,	NULL,  0  },
-		{ "chunk_size", 	1,	NULL,  0  },
+		{ "recovery", 		1,      NULL, 'r' },
+		{ "recovery_fail_io",	1,	NULL, 'e'},
+		{ "recovery_reissue",	1,	NULL, 'i'},
+		{ "get_data",		1,	NULL, 'g'},
+		{ "auto_zc",		0,	NULL,  0 },
+		{ "auto_zc_fallback", 	0,	NULL,  0 },
+		{ "size",		1,	NULL, 's'},
 		{ 0, 0, 0, 0 }
 	};
+	const struct ublk_tgt_ops *ops = NULL;
 	int option_idx, opt;
 	const char *cmd = argv[1];
 	struct dev_ctx ctx = {
@@ -1073,15 +1428,18 @@ int main(int argc, char *argv[])
 		.nr_hw_queues	=	2,
 		.dev_id		=	-1,
 		.tgt_type	=	"unknown",
-		.chunk_size 	= 	65536, 	/* def chunk size is 64K */
 	};
 	int ret = -EINVAL, i;
+	int tgt_argc = 1;
+	char *tgt_argv[MAX_NR_TGT_ARG] = { NULL };
+	int value;
 
 	if (argc == 1)
 		return ret;
 
+	opterr = 0;
 	optind = 2;
-	while ((opt = getopt_long(argc, argv, "t:n:d:q:az",
+	while ((opt = getopt_long(argc, argv, "t:n:d:q:r:e:i:s:gaz",
 				  longopts, &option_idx)) != -1) {
 		switch (opt) {
 		case 'a':
@@ -1103,6 +1461,27 @@ int main(int argc, char *argv[])
 		case 'z':
 			ctx.flags |= UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_USER_COPY;
 			break;
+		case 'r':
+			value = strtol(optarg, NULL, 10);
+			if (value)
+				ctx.flags |= UBLK_F_USER_RECOVERY;
+			break;
+		case 'e':
+			value = strtol(optarg, NULL, 10);
+			if (value)
+				ctx.flags |= UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_FAIL_IO;
+			break;
+		case 'i':
+			value = strtol(optarg, NULL, 10);
+			if (value)
+				ctx.flags |= UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE;
+			break;
+		case 'g':
+			ctx.flags |= UBLK_F_NEED_GET_DATA;
+			break;
+		case 's':
+			ctx.size = strtoull(optarg, NULL, 10);
+			break;
 		case 0:
 			if (!strcmp(longopts[option_idx].name, "debug_mask"))
 				ublk_dbg_mask = strtol(optarg, NULL, 16);
@@ -1110,9 +1489,41 @@ int main(int argc, char *argv[])
 				ublk_dbg_mask = 0;
 			if (!strcmp(longopts[option_idx].name, "foreground"))
 				ctx.fg = 1;
-			if (!strcmp(longopts[option_idx].name, "chunk_size"))
-				ctx.chunk_size = strtol(optarg, NULL, 10);
+			if (!strcmp(longopts[option_idx].name, "auto_zc"))
+				ctx.flags |= UBLK_F_AUTO_BUF_REG;
+			if (!strcmp(longopts[option_idx].name, "auto_zc_fallback"))
+				ctx.auto_zc_fallback = 1;
+			break;
+		case '?':
+			/*
+			 * target requires every option must have argument
+			 */
+			if (argv[optind][0] == '-' || argv[optind - 1][0] != '-') {
+				fprintf(stderr, "every target option requires argument: %s %s\n",
+						argv[optind - 1], argv[optind]);
+				exit(EXIT_FAILURE);
+			}
+
+			if (tgt_argc < (MAX_NR_TGT_ARG - 1) / 2) {
+				tgt_argv[tgt_argc++] = argv[optind - 1];
+				tgt_argv[tgt_argc++] = argv[optind];
+			} else {
+				fprintf(stderr, "too many target options\n");
+				exit(EXIT_FAILURE);
+			}
+			optind += 1;
+			break;
 		}
+	}
+
+	/* auto_zc_fallback depends on F_AUTO_BUF_REG & F_SUPPORT_ZERO_COPY */
+	if (ctx.auto_zc_fallback &&
+	    !((ctx.flags & UBLK_F_AUTO_BUF_REG) &&
+		    (ctx.flags & UBLK_F_SUPPORT_ZERO_COPY))) {
+		ublk_err("%s: auto_zc_fallback is set but neither "
+				"F_AUTO_BUF_REG nor F_SUPPORT_ZERO_COPY is enabled\n",
+					__func__);
+		return -EINVAL;
 	}
 
 	i = optind;
@@ -1120,9 +1531,25 @@ int main(int argc, char *argv[])
 		ctx.files[ctx.nr_files++] = argv[i++];
 	}
 
+	ops = ublk_find_tgt(ctx.tgt_type);
+	if (ops && ops->parse_cmd_line) {
+		optind = 0;
+
+		tgt_argv[0] = ctx.tgt_type;
+		ops->parse_cmd_line(&ctx, tgt_argc, tgt_argv);
+	}
+
 	if (!strcmp(cmd, "add"))
 		ret = cmd_dev_add(&ctx);
-	else if (!strcmp(cmd, "del"))
+	else if (!strcmp(cmd, "recover")) {
+		if (ctx.dev_id < 0) {
+			fprintf(stderr, "device id isn't provided for recovering\n");
+			ret = -EINVAL;
+		} else {
+			ctx.recovery = 1;
+			ret = cmd_dev_add(&ctx);
+		}
+	} else if (!strcmp(cmd, "del"))
 		ret = cmd_dev_del(&ctx);
 	else if (!strcmp(cmd, "list")) {
 		ctx.all = 1;
@@ -1131,6 +1558,10 @@ int main(int argc, char *argv[])
 		ret = cmd_dev_help(argv[0]);
 	else if (!strcmp(cmd, "features"))
 		ret = cmd_dev_get_features();
+	else if (!strcmp(cmd, "update_size"))
+		ret = cmd_dev_update_size(&ctx);
+	else if (!strcmp(cmd, "quiesce"))
+		ret = cmd_dev_quiesce(&ctx);
 	else
 		cmd_dev_help(argv[0]);
 
