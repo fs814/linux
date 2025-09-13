@@ -36,15 +36,19 @@ static bool io_kbuf_inc_commit(struct io_buffer_list *bl, int len)
 {
 	while (len) {
 		struct io_uring_buf *buf;
-		u32 this_len;
+		u32 buf_len, this_len;
 
 		buf = io_ring_head_to_buf(bl->buf_ring, bl->head, bl->mask);
-		this_len = min_t(int, len, buf->len);
-		buf->len -= this_len;
-		if (buf->len) {
+		buf_len = READ_ONCE(buf->len);
+		this_len = min_t(u32, len, buf_len);
+		buf_len -= this_len;
+		/* Stop looping for invalid buffer length of 0 */
+		if (buf_len || !this_len) {
 			buf->addr += this_len;
+			buf->len = buf_len;
 			return false;
 		}
+		buf->len = 0;
 		bl->head++;
 		len -= this_len;
 	}
@@ -108,6 +112,7 @@ bool io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags)
 	buf = req->kbuf;
 	bl = io_buffer_get_list(ctx, buf->bgid);
 	list_add(&buf->list, &bl->buf_list);
+	bl->nbufs++;
 	req->flags &= ~REQ_F_BUFFER_SELECTED;
 
 	io_ring_submit_unlock(ctx, issue_flags);
@@ -122,6 +127,7 @@ static void __user *io_provided_buffer_select(struct io_kiocb *req, size_t *len,
 
 		kbuf = list_first_entry(&bl->buf_list, struct io_buffer, list);
 		list_del(&kbuf->list);
+		bl->nbufs--;
 		if (*len == 0 || *len > kbuf->len)
 			*len = kbuf->len;
 		if (list_empty(&bl->buf_list))
@@ -157,6 +163,7 @@ static void __user *io_ring_buffer_select(struct io_kiocb *req, size_t *len,
 	__u16 tail, head = bl->head;
 	struct io_uring_buf *buf;
 	void __user *ret;
+	u32 buf_len;
 
 	tail = smp_load_acquire(&br->tail);
 	if (unlikely(tail == head))
@@ -166,8 +173,9 @@ static void __user *io_ring_buffer_select(struct io_kiocb *req, size_t *len,
 		req->flags |= REQ_F_BL_EMPTY;
 
 	buf = io_ring_head_to_buf(br, head, bl->mask);
-	if (*len == 0 || *len > buf->len)
-		*len = buf->len;
+	buf_len = READ_ONCE(buf->len);
+	if (*len == 0 || *len > buf_len)
+		*len = buf_len;
 	req->flags |= REQ_F_BUFFER_RING | REQ_F_BUFFERS_COMMIT;
 	req->buf_list = bl;
 	req->buf_index = buf->bid;
@@ -263,13 +271,17 @@ static int io_ring_buffers_peek(struct io_kiocb *req, struct buf_sel_arg *arg,
 
 	req->buf_index = buf->bid;
 	do {
-		u32 len = buf->len;
+		u32 len = READ_ONCE(buf->len);
 
 		/* truncate end piece, if needed, for non partial buffers */
 		if (len > arg->max_len) {
 			len = arg->max_len;
-			if (!(bl->flags & IOBL_INC))
+			if (!(bl->flags & IOBL_INC)) {
+				arg->partial_map = 1;
+				if (iov != arg->iovs)
+					break;
 				buf->len = len;
+			}
 		}
 
 		iov->iov_base = u64_to_user_ptr(buf->addr);
@@ -390,6 +402,7 @@ static int io_remove_buffers_legacy(struct io_ring_ctx *ctx,
 	for (i = 0; i < nbufs && !list_empty(&bl->buf_list); i++) {
 		nxt = list_first_entry(&bl->buf_list, struct io_buffer, list);
 		list_del(&nxt->list);
+		bl->nbufs--;
 		kfree(nxt);
 		cond_resched();
 	}
@@ -491,14 +504,24 @@ static int io_add_buffers(struct io_ring_ctx *ctx, struct io_provide_buf *pbuf,
 {
 	struct io_buffer *buf;
 	u64 addr = pbuf->addr;
-	int i, bid = pbuf->bid;
+	int ret = -ENOMEM, i, bid = pbuf->bid;
 
 	for (i = 0; i < pbuf->nbufs; i++) {
+		/*
+		 * Nonsensical to have more than sizeof(bid) buffers in a
+		 * buffer list, as the application then has no way of knowing
+		 * which duplicate bid refers to what buffer.
+		 */
+		if (bl->nbufs == USHRT_MAX) {
+			ret = -EOVERFLOW;
+			break;
+		}
 		buf = kmalloc(sizeof(*buf), GFP_KERNEL_ACCOUNT);
 		if (!buf)
 			break;
 
 		list_add_tail(&buf->list, &bl->buf_list);
+		bl->nbufs++;
 		buf->addr = addr;
 		buf->len = min_t(__u32, pbuf->len, MAX_RW_COUNT);
 		buf->bid = bid;
@@ -508,7 +531,7 @@ static int io_add_buffers(struct io_ring_ctx *ctx, struct io_provide_buf *pbuf,
 		cond_resched();
 	}
 
-	return i ? 0 : -ENOMEM;
+	return i ? 0 : ret;
 }
 
 static int __io_manage_buffers_legacy(struct io_kiocb *req,

@@ -184,7 +184,7 @@ static inline int pud_none(pud_t pud)
 
 static inline int pud_bad(pud_t pud)
 {
-	return !pud_present(pud);
+	return !pud_present(pud) || (pud_val(pud) & _PAGE_LEAF);
 }
 
 #define pud_leaf	pud_leaf
@@ -397,23 +397,8 @@ static inline struct page *pgd_page(pgd_t pgd)
 p4d_t *p4d_offset(pgd_t *pgd, unsigned long address);
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-static inline int pte_devmap(pte_t pte);
 static inline pte_t pmd_pte(pmd_t pmd);
-
-static inline int pmd_devmap(pmd_t pmd)
-{
-	return pte_devmap(pmd_pte(pmd));
-}
-
-static inline int pud_devmap(pud_t pud)
-{
-	return 0;
-}
-
-static inline int pgd_devmap(pgd_t pgd)
-{
-	return 0;
-}
+static inline pte_t pud_pte(pud_t pud);
 #endif
 
 #endif /* _ASM_RISCV_PGTABLE_64_H */

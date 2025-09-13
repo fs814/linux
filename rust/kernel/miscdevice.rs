@@ -17,7 +17,6 @@ use crate::{
     mm::virt::VmaNew,
     prelude::*,
     seq_file::SeqFile,
-    str::CStr,
     types::{ForeignOwnable, Opaque},
 };
 use core::{marker::PhantomData, mem::MaybeUninit, pin::Pin};
@@ -34,7 +33,7 @@ impl MiscDeviceOptions {
     pub const fn into_raw<T: MiscDevice>(self) -> bindings::miscdevice {
         // SAFETY: All zeros is valid for this C type.
         let mut result: bindings::miscdevice = unsafe { MaybeUninit::zeroed().assume_init() };
-        result.minor = bindings::MISC_DYNAMIC_MINOR as _;
+        result.minor = bindings::MISC_DYNAMIC_MINOR as ffi::c_int;
         result.name = self.name.as_char_ptr();
         result.fops = MiscdeviceVTable::<T>::build();
         result
@@ -45,7 +44,13 @@ impl MiscDeviceOptions {
 ///
 /// # Invariants
 ///
-/// `inner` is a registered misc device.
+/// - `inner` contains a `struct miscdevice` that is registered using
+///   `misc_register()`.
+/// - This registration remains valid for the entire lifetime of the
+///   [`MiscDeviceRegistration`] instance.
+/// - Deregistration occurs exactly once in [`Drop`] via `misc_deregister()`.
+/// - `inner` wraps a valid, pinned `miscdevice` created using
+///   [`MiscDeviceOptions::into_raw`].
 #[repr(transparent)]
 #[pin_data(PinnedDrop)]
 pub struct MiscDeviceRegistration<T> {
@@ -92,7 +97,7 @@ impl<T: MiscDevice> MiscDeviceRegistration<T> {
         // function tells the borrow-checker that the `&Device` reference must not outlive the
         // `&MiscDeviceRegistration<T>` used to obtain it, so the last use of the reference must be
         // before the underlying `struct miscdevice` is destroyed.
-        unsafe { Device::as_ref((*self.as_raw()).this_device) }
+        unsafe { Device::from_raw((*self.as_raw()).this_device) }
     }
 }
 
@@ -138,7 +143,7 @@ pub trait MiscDevice: Sized {
 
     /// Handler for ioctls.
     ///
-    /// The `cmd` argument is usually manipulated using the utilties in [`kernel::ioctl`].
+    /// The `cmd` argument is usually manipulated using the utilities in [`kernel::ioctl`].
     ///
     /// [`kernel::ioctl`]: mod@crate::ioctl
     fn ioctl(
@@ -253,7 +258,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: This is a Rust Miscdevice, so we call `into_foreign` in `open` and
         // `from_foreign` in `release`, and `fops_mmap` is guaranteed to be called between those
         // two operations.
-        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
+        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private.cast()) };
         // SAFETY: The caller provides a vma that is undergoing initial VMA setup.
         let area = unsafe { VmaNew::from_raw(vma) };
         // SAFETY:
